@@ -20,7 +20,8 @@ from datarecord.schema import (
     Dimension,
     Group,
     Schema,
-    Trait,
+    TypeAttribute,
+    TypeSpec,
 )
 
 # No `entity_type`: an attribute row is keyed by `name`, unique across every type
@@ -398,23 +399,35 @@ def schema(
     - [within](https://energy-models.github.io/datarecord/design/schema/#within-an-axis-inside-an-axis)
     """
     nesting = within or {}
-    # Callers declare per type, which is how a modelling framework thinks; the
-    # schema stores one spec per attribute, record-wide, and a trait per type
-    # narrows it back. Flattening here keeps the tests readable and is exactly
+    # Callers declare per type, which is how a modelling framework thinks and
+    # how the schema stores it: one record-wide spec per attribute, granted per
+    # type in `types` with the facets on the grant. Splitting here is exactly
     # what a tool does on the way in.
     flat: dict[str, AttributeSpec] = {}
-    traits: dict[str, Trait] = {}
+    per_type: dict[str, dict[str, TypeAttribute]] = {}
     for ctype, attrs in (attributes or {}).items():
+        grants = per_type.setdefault(ctype, {})
         for attr, spec in attrs.items():
-            flat.setdefault(attr, spec)
-        traits[ctype] = Trait(
-            attributes=frozenset(attrs), on={"entity_type": frozenset({ctype})}
-        )
+            flat.setdefault(
+                attr,
+                spec.model_copy(
+                    update={"default": None, "unit": None, "description": None}
+                ),
+            )
+            grants[attr] = TypeAttribute(
+                default=spec.default, unit=spec.unit, description=spec.description
+            )
     # Declared whether or not a caller named them: a test writing `p_max_pu`
-    # needs it declared, and one passing `attributes=` is narrowing what a type
-    # *carries* rather than shortening the record's vocabulary.
+    # needs it declared, and one passing `attributes=` is saying what a type
+    # *carries* rather than shortening the record's vocabulary - so the default
+    # attributes are granted to every declared type, as an untyped schema
+    # already carries them everywhere.
     for attr, spec in _default_attributes(dims, groups).items():
         flat.setdefault(attr, spec)
+        if per_type and spec.dims & ({"entity"} | set(groups)):
+            for grants in per_type.values():
+                grants.setdefault(attr, TypeAttribute())
+    types = {c: TypeSpec(attributes=g) for c, g in per_type.items()}
     # A group's coordinates are dims like any other, so they are declared here
     # rather than assumed - which is what lets a caller pass a group over
     # coordinates that are not called `bus`.
@@ -433,12 +446,16 @@ def schema(
             d: Dimension(dtype=t, within=frozenset(nesting.get(d, set())))
             for d, t in declared.items()
         }
-        # A plain string rather than an enum: the tests name types freely, and
-        # pinning the categories here would make every fixture that adds one
-        # declare it twice (https://energy-models.github.io/datarecord/design/schema/#entity_type-the-axis-of-kinds).
-        | {"entity_type": Dimension(dtype=nw.String())},
+        # An enum where the caller declared per type - `types` requires one -
+        # and a plain string otherwise, so untyped fixtures keep naming types
+        # freely (https://energy-models.github.io/datarecord/design/schema/#entity_type-the-axis-of-kinds).
+        | {
+            "entity_type": Dimension(
+                dtype=nw.Enum(sorted(types)) if types else nw.String()
+            )
+        },
         attributes=flat,
-        traits=traits,
+        types=types,
         # `partial` names value dims a layer patches per value; membership keys
         # (`entity`, a group's coordinates) are in the fold key by being
         # membership, not by being `partial` (https://energy-models.github.io/datarecord/design/read-path/#one-fold-for-every-axis).

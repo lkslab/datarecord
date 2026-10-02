@@ -65,6 +65,29 @@ def _dump_dtype(dtype: nw.dtypes.DType) -> Any:
     raise ValueError(msg)
 
 
+def _dump_default(value: Any) -> Any:
+    """Encode a non-finite default as a string; JSON has no literal for one.
+
+    `inf` is an ordinary default for an unbounded capacity, and JSON's
+    `Infinity` is not valid JSON - a plain dump reads back as `None`, turning
+    "unbounded" into "no default". `_parse_default` reverses this. Shared by
+    every model with a `default` field, so no site can forget the encoding.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return f"__{value}__"
+    return value
+
+
+def _parse_default(value: Any) -> Any:
+    """Decode what `_dump_default` encoded."""
+    if isinstance(value, str) and value.startswith("__") and value.endswith("__"):
+        try:
+            return float(value[2:-2])
+        except ValueError:
+            return value
+    return value
+
+
 def _parse_dtype(value: Any) -> nw.dtypes.DType:
     """The `dtype=` field_validator shared by `Dimension` and `AttributeSpec`.
 
@@ -179,6 +202,11 @@ class Dimension(BaseModel):
 class AttributeSpec(BaseModel):
     """What shape one attribute's data may take.
 
+    `default`, `unit` and `description` live where the attribute is addressed:
+    here for an axis-addressed attribute or an untyped schema, on the grants
+    (`Schema.types`) for a per-component attribute in a typed schema - where a
+    spec-level facet is rejected, so no fact has two authoritative slots.
+
     Attributes
     ----------
     dtype
@@ -229,26 +257,12 @@ class AttributeSpec(BaseModel):
 
     @field_serializer("default")
     def _serialise_default(self, value: Any) -> Any:
-        """Encode a non-finite default as a string; JSON has no literal for one.
-
-        `inf` is an ordinary default for an unbounded capacity, and JSON's
-        `Infinity` is not valid JSON - a plain dump reads back as `None`,
-        turning "unbounded" into "no default". `_parse_default` reverses this.
-        """
-        if isinstance(value, float) and not math.isfinite(value):
-            return f"__{value}__"
-        return value
+        return _dump_default(value)
 
     @field_validator("default", mode="before")
     @classmethod
     def _parse_default(cls, value: Any) -> Any:
-        """Decode what `_serialise_default` encoded."""
-        if isinstance(value, str) and value.startswith("__") and value.endswith("__"):
-            try:
-                return float(value[2:-2])
-            except ValueError:
-                return value
-        return value
+        return _parse_default(value)
 
     @property
     def varying(self) -> bool:
@@ -337,29 +351,83 @@ class Group(BaseModel):
         return tuple(self.over)
 
 
-class Trait(BaseModel):
-    """A named bundle of attributes, and which entity types and components carry it.
+class TypeAttribute(BaseModel):
+    """One type's facets for one attribute it carries.
 
-    The narrowing direction: an attribute the schema declares is carried by
-    every entity type it can address, and a trait is how that is cut down to
-    some of them, and further to some of those. A trait bundling `p_max_pu`
-    `on={"entity_type": {"Generator"}}` says those attributes reach generators
-    and nothing else.
+    Being a key of `TypeSpec.attributes` is the grant; this is what the type
+    says about the attribute beyond carrying it. No inheritance: an absent
+    facet is undeclared, never "the spec's value" - in a typed schema an
+    entity-addressed attribute's spec carries no facets at all.
+
+    Attributes
+    ----------
+    default
+        The value a coordinate no row covers takes, for this type.
+    unit
+        What the values measure, for this type - `None` is undeclared, `""`
+        genuinely dimensionless. Stored and never interpreted.
+    description
+        What the attribute is on this type, in prose. Never interpreted.
+
+    Notes
+    -----
+    - [types](https://energy-models.github.io/datarecord/design/schema/#types-what-a-type-carries)
+    """
+
+    default: Any | None = None
+    unit: str | None = None
+    description: str | None = None
+
+    @field_serializer("default")
+    def _serialise_default(self, value: Any) -> Any:
+        return _dump_default(value)
+
+    @field_validator("default", mode="before")
+    @classmethod
+    def _parse_default(cls, value: Any) -> Any:
+        return _parse_default(value)
+
+
+class TypeSpec(BaseModel):
+    """One entity type: what it carries, and what it is.
 
     Attributes
     ----------
     attributes
-        The attributes this trait bundles. Each must be declared. Includes
-        `switch` once parsed, whatever the author wrote.
-    on
-        Mapping dim -> the labels of it this trait applies to. Only the
-        entity-type axis may key this, since that is the axis an attribute
-        vocabulary partitions - `Schema` rejects any other. Empty means this
-        narrowing does not apply, reaching every type.
+        Attribute -> its facets on this type. A key here is the grant: the
+        type carries the attribute, and `{}` is carried with nothing declared
+        about it. Every key must be a declared, entity-addressed attribute.
+    description
+        What the type is, in prose - what an `Enum` label cannot carry.
+        Never interpreted.
+
+    Notes
+    -----
+    - [types](https://energy-models.github.io/datarecord/design/schema/#types-what-a-type-carries)
+    """
+
+    attributes: dict[str, TypeAttribute] = Field(default_factory=dict)
+    description: str | None = None
+
+
+class Trait(BaseModel):
+    """A capability some components of a type opt into, decided by a switch.
+
+    A trait says nothing about which attributes a type carries - `Schema.types`
+    does. It connects a bundle to the attribute that gates it per component:
+    which components carry a *value* is what the switch narrows, never the
+    vocabulary. Which types may carry the capability is not declared here
+    either; it is the types granted the switch, one source of truth.
+
+    Attributes
+    ----------
+    attributes
+        The attributes this trait bundles. Each must be declared, and granted
+        on every type granted the switch. Includes `switch` once parsed,
+        whatever the author wrote.
     switch
         The attribute deciding, per component, whether this trait applies -
-        `dims={"entity"}` exactly. `None` means this narrowing does not
-        apply, reaching every component.
+        `dims={"entity"}` exactly.
     description
         What the trait is, in prose. Never interpreted.
 
@@ -370,14 +438,13 @@ class Trait(BaseModel):
     """
 
     attributes: frozenset[str] = frozenset()
-    on: dict[str, frozenset[str]] = Field(default_factory=dict)
-    switch: str | None = None
+    switch: str
     description: str | None = None
 
     @model_validator(mode="after")
     def _fold_switch_into_attributes(self) -> Trait:
         """Add `switch` to `attributes`, so a caller need not name it twice."""
-        if self.switch is not None and self.switch not in self.attributes:
+        if self.switch not in self.attributes:
             self.attributes = self.attributes | {self.switch}
         return self
 
@@ -399,10 +466,14 @@ class Schema(BaseModel):
         Group name -> which tuples over several dims exist. `connection` is
         the one every record with connections declares, and the entity-type
         axis is the group `into` that axis over `[entity]`.
+    types
+        Entity-type label -> what that type carries, with the per-type facets
+        (default, unit, description) on each grant. Keys must equal the
+        entity-type axis's Enum labels exactly; absent for a schema whose
+        labels are data or that declares no type axis.
     traits
-        Trait -> the attributes it bundles and the entity types carrying them.
-        A vocabulary a consumer dispatches on, declared rather than derived,
-        and the only thing that narrows an attribute to some entity types.
+        Trait -> a capability a component opts into via its switch. Says
+        nothing about presence, which is `types`' alone.
     partial
         Which dims a layer may patch value by value. `None` for a record
         with no layers, since nothing overrides anything. A dim outside it is
@@ -434,6 +505,7 @@ class Schema(BaseModel):
     """
 
     groups: dict[str, Group] = Field(default_factory=dict)
+    types: dict[str, TypeSpec] = Field(default_factory=dict)
     traits: dict[str, Trait] = Field(default_factory=dict)
     partial: frozenset[str] | None = None
     meta: dict[str, Any] = Field(default_factory=dict)
@@ -446,6 +518,7 @@ class Schema(BaseModel):
         -----
         - [dimensions](https://energy-models.github.io/datarecord/design/schema/#dimensions)
         - [groups](https://energy-models.github.io/datarecord/design/schema/#groups)
+        - [types](https://energy-models.github.io/datarecord/design/schema/#types-what-a-type-carries)
         - [traits](https://energy-models.github.io/datarecord/design/schema/#traits)
         - [within](https://energy-models.github.io/datarecord/design/schema/#within-an-axis-inside-an-axis)
         """
@@ -551,35 +624,97 @@ class Schema(BaseModel):
                     )
                     raise ValueError(msg)
 
+        # The per-type declaration: `types` grants, and grants are the whole
+        # answer for what a type carries - so its keys must be the declared
+        # vocabulary, every grant a real per-component attribute, and every
+        # per-component attribute granted somewhere.
+        labels = self.entity_types
+        if self.types:
+            if not labels:
+                msg = (
+                    "`types` requires an entity-type axis with an Enum dtype; "
+                    "a schema whose type labels are data has nothing declared "
+                    "to grant to"
+                )
+                raise ValueError(msg)
+            missing = sorted(labels - set(self.types))
+            stray = sorted(set(self.types) - labels)
+            if missing or stray:
+                msg = (
+                    f"`types` keys must equal the entity-type labels exactly; "
+                    f"missing {missing}, unknown {stray}"
+                )
+                raise ValueError(msg)
+        for ctype, type_spec in self.types.items():
+            for attr in sorted(type_spec.attributes):
+                if attr in self.results:
+                    msg = (
+                        f"type {ctype!r} grants {attr!r}, which is a result; "
+                        f"results are exempt from the per-type vocabulary"
+                    )
+                    raise ValueError(msg)
+                if attr not in self.attributes:
+                    msg = f"type {ctype!r} grants undeclared attribute {attr!r}"
+                    raise ValueError(msg)
+                if not self.addresses_entity(attr):
+                    msg = (
+                        f"type {ctype!r} grants {attr!r}, which no entity "
+                        f"addresses; it belongs to the record, not to a type"
+                    )
+                    raise ValueError(msg)
+        if labels:
+            granted = {a for ts in self.types.values() for a in ts.attributes}
+            unreachable = sorted(
+                a
+                for a in self.attributes
+                if self.addresses_entity(a) and a not in granted
+            )
+            if unreachable:
+                msg = (
+                    f"attributes {unreachable} are addressed by `entity` but "
+                    f"granted by no type; grant them in `types` or drop them"
+                )
+                raise ValueError(msg)
+            # Facets live where the attribute is addressed: on the grants for
+            # a per-component attribute, so the manifest never holds two slots
+            # that both look authoritative.
+            for attr, attr_spec in self.attributes.items():
+                facets = (attr_spec.default, attr_spec.unit, attr_spec.description)
+                if any(f is not None for f in facets) and self.addresses_entity(attr):
+                    msg = (
+                        f"attribute {attr!r} carries a spec-level default, unit "
+                        f"or description but is per-component in a typed schema; "
+                        f"those facets live on the grants in `types`"
+                    )
+                    raise ValueError(msg)
+
         # A trait may only name an attribute that is declared: it says which
-        # attributes apply, never what they are, so a name with no spec is a
-        # typo rather than a shorthand declaration.
+        # attributes a capability bundles, never what they are, so a name with
+        # no spec is a typo rather than a shorthand declaration.
         for trait, trait_spec in self.traits.items():
             unknown = sorted(trait_spec.attributes - set(self.attributes))
             if unknown:
                 msg = f"trait {trait!r} bundles undeclared attributes {unknown}"
                 raise ValueError(msg)
-            # Only the entity-type axis may scope a trait. Any other
-            # classification would make the vocabulary depend on data rather
-            # than on the schema - which attributes a component carries would
-            # follow from what its bus maps to, a per-entity lookup every caller
-            # of `attributes_for` treats as answerable from the schema alone.
-            for dim in trait_spec.on:
-                if dim != entity_type:
+            switch_spec = self.attributes.get(trait_spec.switch)
+            if switch_spec is not None and switch_spec.dims != {"entity"}:
+                msg = (
+                    f"trait {trait!r} is switched on {trait_spec.switch!r}, "
+                    f"which is addressed by {sorted(switch_spec.dims)}; a "
+                    f"switch decides a trait per component, so it is "
+                    f"addressed by `entity` alone"
+                )
+                raise ValueError(msg)
+            for ctype, type_spec in self.types.items():
+                if trait_spec.switch not in type_spec.attributes:
+                    continue
+                ungranted = sorted(trait_spec.attributes - set(type_spec.attributes))
+                if ungranted:
                     msg = (
-                        f"trait {trait!r} is `on` {dim!r}, which does not classify "
-                        f"`entity`; only the entity-type axis partitions an "
-                        f"attribute vocabulary"
-                    )
-                    raise ValueError(msg)
-            if trait_spec.switch is not None:
-                switch_spec = self.attributes.get(trait_spec.switch)
-                if switch_spec is not None and switch_spec.dims != {"entity"}:
-                    msg = (
-                        f"trait {trait!r} is switched on {trait_spec.switch!r}, "
-                        f"which is addressed by {sorted(switch_spec.dims)}; a "
-                        f"switch decides a trait per component, so it is "
-                        f"addressed by `entity` alone"
+                        f"type {ctype!r} is granted the switch "
+                        f"{trait_spec.switch!r} of trait {trait!r} but not its "
+                        f"attributes {ungranted}; a capability's bundle travels "
+                        f"with its switch"
                     )
                     raise ValueError(msg)
 
@@ -775,7 +910,7 @@ class Schema(BaseModel):
         True where its `dims` name `entity`, or a group one of whose
         coordinates draws on `entity`. False for an attribute over an axis
         alone - a snapshot weighting belongs to the record, so no entity type
-        carries it however few traits mention it.
+        carries it and no grant may name it.
 
         Notes
         -----
@@ -784,41 +919,42 @@ class Schema(BaseModel):
         return "entity" in self.coordinates_of(attribute)
 
     def attributes_for(self, ctype: str) -> dict[str, AttributeSpec]:
-        """Which attributes entity type `ctype` carries.
+        """Which attributes entity type `ctype` carries, with its facets.
 
-        Every attribute addressed by `entity` that no trait narrows, plus those
-        the traits naming `ctype` bundle. Untraited is carried by all: writing
-        `entity` in an attribute's `dims` is what says it is per component, and
-        declining to bundle it says it is so for every type - the same thing
-        `dims={"scenario"}` already means along the scenario axis.
+        The grants of `types[ctype]`, each spec a copy carrying that grant's
+        `default`, `unit` and `description` - so the caller reads one object
+        for "what is `sign` on a Load and what is its default". Answered from
+        the schema alone, never from data. `Schema.attributes[a]` is untouched.
 
         Empty for a label no declared entity-type axis lists, which is why
         callers rejecting an unknown type test `entity_types` rather than this.
         A schema declaring no entity type at all carries everything addressed
-        by `entity`, whatever `ctype` is asked for.
+        by `entity`, whatever `ctype` is asked for, with the spec's own facets.
 
         Notes
         -----
-        - [traits](https://energy-models.github.io/datarecord/design/schema/#traits)
+        - [types](https://energy-models.github.io/datarecord/design/schema/#types-what-a-type-carries)
         """
         known = self.entity_types
-        if known and ctype not in known:
+        if not known:
+            return {
+                a: self.attributes[a]
+                for a in sorted(self.attributes)
+                if self.addresses_entity(a)
+            }
+        granted = self.types.get(ctype)
+        if granted is None:
             return {}
-        narrowed: set[str] = set()
-        names: set[str] = set()
-        for trait in self.traits.values():
-            # A trait with no `on` narrows nothing: it is a bundle to dispatch
-            # on, so its attributes stay carried by every type.
-            scoped = {ctype for labels in trait.on.values() for ctype in labels}
-            if not scoped:
-                continue
-            narrowed |= trait.attributes
-            if any(ctype in labels for labels in trait.on.values()):
-                names |= trait.attributes
-        names |= {
-            a for a in self.attributes if a not in narrowed and self.addresses_entity(a)
+        return {
+            a: self.attributes[a].model_copy(
+                update={
+                    "default": facets.default,
+                    "unit": facets.unit,
+                    "description": facets.description,
+                }
+            )
+            for a, facets in sorted(granted.attributes.items())
         }
-        return {a: self.attributes[a] for a in sorted(names)}
 
     def owned_per(self, attribute: str) -> frozenset[str]:
         """Which dims a layer owns `attribute` per.
@@ -1127,7 +1263,7 @@ class Schema(BaseModel):
         - [set](https://energy-models.github.io/datarecord/design/working-record/#set)
         """
         return frozenset(
-            c for c in self.entity_types if attribute in self.attributes_for(c)
+            c for c, spec in self.types.items() if attribute in spec.attributes
         )
 
     # -- versioning (https://energy-models.github.io/datarecord/design/schema/#versioning) --------------------------------------------------

@@ -8,6 +8,8 @@ SPDX-License-Identifier: CC-BY-4.0
 
 Status: **Draft** · Drafted 2026-08-27
 
+Partly superseded: [per-type attributes](per-type-attributes.md) moved presence to an explicit per-type declaration and dropped `on`, so a trait's `switch` is now its only narrowing and the four-combination table below no longer describes the schema. The switch's own semantics, and the data-reading checks this proposal defers, stand as written.
+
 Stacked on [groups](groups.md), which it does not depend on but shares a direction with: what a record can say about a component should be declared rather than encoded in a type name.
 
 ## What starts it

@@ -11,6 +11,15 @@ All notable changes to datarecord are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Per-type attribute facts are first-class: `Schema.types` declares what each
+  entity type carries, with per-type `default`, `unit` and `description` on the
+  grant, and `attributes_for` reads it alone. Traits no longer decide presence:
+  `Trait.on` is gone, `switch` is required, and a trait is a per-component
+  capability. The PyPSA tool emits the types table from the registry instead of
+  one trait per type. See `docs/design/proposals/per-type-attributes.md`.
+
 ### Fixed
 
 - Reading an attribute over a `partial` dim no longer slows with the square

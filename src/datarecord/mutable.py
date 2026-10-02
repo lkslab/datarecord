@@ -2172,7 +2172,7 @@ def _member_columns(schema: Schema, ctype: str) -> dict[str, nw.dtypes.DType]:
     Notes
     -----
     - [where a value lives](https://energy-models.github.io/datarecord/design/format/#where-a-value-lives)
-    - [traits](https://energy-models.github.io/datarecord/design/schema/#traits)
+    - [types](https://energy-models.github.io/datarecord/design/schema/#types-what-a-type-carries)
     """
     own = {
         name: schema.value_type(name) or nw.String()
