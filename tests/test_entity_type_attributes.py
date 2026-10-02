@@ -25,7 +25,14 @@ from datarecord import Revision
 from datarecord.duck import layer_dir
 from datarecord.layered.resolve import write_schema
 from datarecord.mutable import NewChild, WorkingRecord
-from datarecord.schema import AttributeSpec, Dimension, Group, Schema
+from datarecord.schema import (
+    AttributeSpec,
+    Dimension,
+    Group,
+    Schema,
+    TypeAttribute,
+    TypeSpec,
+)
 from tests.fixtures import write_axis
 
 TYPES = ["Bus", "Generator"]
@@ -45,6 +52,12 @@ def typed_schema():
             "icon": AttributeSpec(
                 dtype=nw.String(), dims={"entity_type"}, default="dot"
             ),
+        },
+        # `icon` appears in no grant: addressed by the type axis alone, it
+        # belongs to no component, and a grant naming it is rejected.
+        types={
+            "Bus": TypeSpec(),
+            "Generator": TypeSpec(attributes={"p_nom": TypeAttribute()}),
         },
         # `entity_type` is deliberately *not* partial: `partial` widens the owner
         # map and the resolution it keys, so it is kept to what a layer really

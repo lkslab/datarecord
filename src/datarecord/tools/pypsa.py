@@ -34,7 +34,7 @@ from duckdb import StarExpression as star
 
 from datarecord.duck import ex_all
 from datarecord.record import Flags, Frames, LazyFrames, RecordLike
-from datarecord.schema import AttributeSpec, Dimension, Group, Trait
+from datarecord.schema import AttributeSpec, Dimension, Group, TypeAttribute, TypeSpec
 from datarecord.schema import Schema as RecordSchema
 from datarecord.tools.base import (
     Requirements,
@@ -1212,8 +1212,8 @@ class _NetworkSource:
 
         Results go to `results` rather than `attributes`, read off the same
         registry (`status` starting "Output"), so a PyPSA upgrade adding one is
-        still picked up rather than needing a list kept here. They carry no
-        trait: a trait is the input vocabulary a type is validated and split
+        still picked up rather than needing a list kept here. They get no
+        grant: `types` is the input vocabulary a type is validated and split
         against, and a result is neither.
 
         Notes
@@ -1234,12 +1234,14 @@ class _NetworkSource:
         # a long row - and so the record layer needs no rule of its own for a
         # word that is this tool's vocabulary (https://energy-models.github.io/datarecord/design/format/#where-a-value-lives).
         attributes: dict[str, AttributeSpec] = {
-            ROLE: AttributeSpec(
-                dtype=nw.String(),
-                dims=frozenset({CONNECTION}),
-                description="Which end of the component this attachment is.",
-            )
+            # Facet-free like every per-component spec below: in a typed schema
+            # a description lives on the grants, so `role`'s is repeated per
+            # granting type rather than stated here.
+            ROLE: AttributeSpec(dtype=nw.String(), dims=frozenset({CONNECTION}))
         }
+        role_grant = TypeAttribute(
+            description="Which end of the component this attachment is."
+        )
         if self.n.has_scenarios:
             # A probability per scenario, which `dims` addresses by the scenario
             # axis alone - so it is a column of `dims/scenario.parquet`, where
@@ -1252,7 +1254,7 @@ class _NetworkSource:
                 description="How much this scenario counts in the expectation.",
             )
         results: dict[str, AttributeSpec] = {}
-        carries: dict[str, frozenset[str]] = {}
+        types: dict[str, TypeSpec] = {}
         for c in self.n.components:
             if not _exported(c):
                 continue
@@ -1262,7 +1264,7 @@ class _NetworkSource:
             # agree on every declaration, so either row answers.
             per_port = self._port_stems(c)
             outputs = set(_output_attributes(c))
-            carried: set[str] = set()
+            grants: dict[str, TypeAttribute] = {}
             for attr in defaults.index:
                 if attr == "name":
                     continue
@@ -1275,43 +1277,60 @@ class _NetworkSource:
                 # which expands to `(entity, bus)` (https://energy-models.github.io/datarecord/design/schema/#groups).
                 dims = set(varying_dims) if row["varying"] else set()
                 dims.add(CONNECTION if attr in per_port else ENTITY)
-                spec = AttributeSpec(
-                    dtype=_DTYPES.get(row["typ"], nw.String()),
-                    dims=frozenset(dims),
+                dtype = _DTYPES.get(row["typ"], nw.String())
+                # One attribute, one spec, record-wide: two types declaring the
+                # same name must agree on its shape, since one
+                # `<kind>/<attr>.parquet` with one `value` column serves both.
+                # PyPSA's registry does agree everywhere today, so the first
+                # type to declare one wins and a later disagreement is a schema
+                # error rather than a silent per-type divergence the storage
+                # could not have honoured. Default, unit and description are
+                # free to differ per type, and land on the grant below.
+                if attr in outputs:
+                    # A result is declared but not granted, `types` being the
+                    # input vocabulary a type is validated and split against -
+                    # so its facets stay on the spec, first type wins.
+                    results.setdefault(
+                        stem,
+                        AttributeSpec(
+                            dtype=dtype,
+                            dims=frozenset(dims),
+                            default=_default(row["default"]),
+                            unit=_text(row.get("unit")),
+                            description=_text(row.get("description")),
+                        ),
+                    )
+                    continue
+                if stem in grants:
+                    continue
+                grants[stem] = TypeAttribute(
                     default=_default(row["default"]),
                     unit=_text(row.get("unit")),
                     description=_text(row.get("description")),
                 )
-                # One attribute, one spec, record-wide: two types declaring the
-                # same name must agree, since one `<kind>/<attr>.parquet` with
-                # one `value` column serves both. PyPSA's registry does agree
-                # everywhere today, so the first type to declare one wins and
-                # a later disagreement is a schema error rather than a silent
-                # per-type divergence the storage could not have honoured.
-                if attr in outputs:
-                    # A result is declared but not carried: it belongs to no
-                    # trait, `attributes_for` being the input vocabulary a type
-                    # is validated and split against.
-                    results.setdefault(stem, spec)
-                    continue
-                if stem in carried:
-                    continue
-                carried.add(stem)
-                attributes.setdefault(stem, spec)
-            if carried:
-                carries[c.name] = frozenset(carried)
+                attributes.setdefault(
+                    stem, AttributeSpec(dtype=dtype, dims=frozenset(dims))
+                )
+            # A stem whose record-wide spec no entity addresses is no grant: a
+            # stochastic record's `weight` is the scenario axis's column, and a
+            # same-named registry attribute loses to it (first declaration wins)
+            # rather than granting a per-type reading the file cannot hold.
+            grants = {
+                a: g
+                for a, g in grants.items()
+                if {ENTITY, CONNECTION} & attributes[a].dims
+            }
+            if c.ports:
+                grants[ROLE] = role_grant
+            if grants:
+                types[c.name] = TypeSpec(
+                    attributes=grants,
+                    description=_text(_component_description(c.name)),
+                )
         # A name PyPSA registers as an output on one type and an input on
         # another would be both here; the input declaration wins, one file
         # holding one `value` column either way.
         results = {a: s for a, s in results.items() if a not in attributes}
-        # PyPSA's registry is per type - a `Line` has no `efficiency` - so every
-        # attribute is narrowed to the types that declare it, and none is left
-        # carried by all. One trait per type is the faithful translation of a
-        # registry that ships no trait vocabulary of its own (https://energy-models.github.io/datarecord/design/schema/#traits).
-        traits = {
-            ctype: Trait(attributes=carried, on={ENTITY_TYPE: frozenset({ctype})})
-            for ctype, carried in carries.items()
-        }
         return RecordSchema(
             dimensions={
                 SNAPSHOT: Dimension(
@@ -1336,7 +1355,7 @@ class _NetworkSource:
                 # so an enum rather than a bare string, and a type outside it is
                 # rejected on write.
                 ENTITY_TYPE: Dimension(
-                    dtype=nw.Enum(sorted(carries)),
+                    dtype=nw.Enum(sorted(types)),
                     description="What kind of component an entity is.",
                 ),
             },
@@ -1355,7 +1374,7 @@ class _NetworkSource:
             },
             attributes=attributes,
             results=results,
-            traits=traits,
+            types=types,
             # `partial` names value dims a layer patches per value: a layer may
             # set one generator's `p_nom` per scenario without restating the
             # rest. Membership keys - `entity`, the `connection` group's `bus` -
@@ -1693,6 +1712,13 @@ class _NetworkSource:
         if not frames:
             return nw.from_native(pd.DataFrame(columns=columns)).lazy()
         return nw.from_native(pd.concat(frames, ignore_index=True)[columns]).lazy()
+
+
+def _component_description(ctype: str) -> Any:
+    """`ctype`'s prose description, from PyPSA's type registry."""
+    from pypsa.components.types import get as get_component_type
+
+    return getattr(get_component_type(ctype), "description", None)
 
 
 def _required_attributes(ctype: str) -> frozenset[str]:

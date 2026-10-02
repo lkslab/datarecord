@@ -50,6 +50,7 @@ nav:
           - Dims, mappings, groups and traits: design/proposals/dims-groups-traits.md
           - Groups: design/proposals/groups.md
           - Trait switches: design/proposals/trait-switches.md
+          - Per-type attributes: design/proposals/per-type-attributes.md
           - Staging as a layer: design/proposals/staging-as-a-layer.md
           - One Record over a NodeCache: design/proposals/one-record-over-a-node-cache.md
           - A member file holds values: design/proposals/a-member-file-holds-values.md

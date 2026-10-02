@@ -37,12 +37,26 @@ class Group(BaseModel):
     description: str | None = None
 
 
+class TypeAttribute(BaseModel):
+    """One type's facets for one attribute it carries."""
+
+    default: Any | None = None
+    unit: str | None = None
+    description: str | None = None
+
+
+class TypeSpec(BaseModel):
+    """One entity type: what it carries, and what it is."""
+
+    attributes: dict[str, TypeAttribute] = {}  # the grant: a key here is carried
+    description: str | None = None
+
+
 class Trait(BaseModel):
-    """A bundle of attributes, and which entity types and components carry it."""
+    """A capability some components of a type opt into, decided by a switch."""
 
     attributes: frozenset[str] = frozenset()
-    on: dict[str, frozenset[str]] = {}  # entity-type axis -> the labels it applies to
-    switch: str | None = None  # attribute deciding it per component; joins `attributes`
+    switch: str  # attribute deciding it per component; joins `attributes`
     description: str | None = None
 
 
@@ -53,7 +67,8 @@ class Schema(BaseModel):
     attributes: dict[str, AttributeSpec]  # flat: one attribute, one spec
     results: dict[str, AttributeSpec]  # what a solve computes, governed apart
     groups: dict[str, Group]
-    traits: dict[str, Trait]  # the only thing that narrows an attribute to some types
+    types: dict[str, TypeSpec]  # what each entity type carries, keyed by label
+    traits: dict[str, Trait]  # capabilities, gated per component by a switch
 
     # Which dims a layer may patch value by value; absent for a record with no
     # layers, since nothing overrides anything.
@@ -99,7 +114,7 @@ attributes = {
 }
 ```
 
-**Flat, one spec per attribute**, with [component types subscribing](#traits) rather than owning.
+**Flat, one spec per attribute**, with [component types granted it](#types-what-a-type-carries) rather than owning it.
 The nesting this replaces said an attribute _belongs to_ a component type, which is false in both directions: `objective_weighting` has no type, and `p_max_pu` was three identical specs under Generator, Link and StorageUnit.
 
 The storage already disagreed with the nesting. `inputs/p_max_pu.parquet` holds every type's rows in one file with one `value` dtype, so two types declaring one attribute with **different dtypes** was expressible in the schema and unrepresentable on disk — a silent wrong read that nothing rejected.
@@ -125,7 +140,7 @@ What a solve computes is declared, not discovered: a result has a dtype, coordin
 
 It is a **separate mapping rather than a flag** because the two are governed differently at every point a caller touches them.
 A result is written to `outputs/<attr>.parquet`, never [overlays](read-path.md#outputs) a parent's, and may name a component the record does not declare.
-An input meets [`attributes_for`](#traits), which is the per-type vocabulary that validates a `set` and splits `add`'s wide frame; a result meets none of that, and keeping it out of `attributes` is what makes that structural rather than a condition repeated at each site.
+An input meets [`attributes_for`](#types-what-a-type-carries), which is the per-type vocabulary that validates a `set` and splits `add`'s wide frame; a result meets none of that, and keeping it out of `attributes` is what makes that structural rather than a condition repeated at each site.
 A name in both is rejected: one name is one file with one `value` column, so it is an input or a result and not both.
 
 The questions the long schema asks of a _stored_ attribute — its dtype, its coordinates — span both, since `outputs/` and `inputs/` share a layout.
@@ -169,54 +184,60 @@ A tool that needs types requires the axis in the schema it builds — [PyPSA doe
 
 **At most one.** A second dim `on` `entity` is rejected: a component has one type, and two vocabularies over one axis leave `attributes_for` with no resolved answer for what it carries.
 
-## Traits
+## Types: what a type carries
 
-A trait is a named bundle of attributes, and which entity types carry them:
+Each entity type declares what it carries, with the per-type facets on the grant:
 
 ```python
-traits = {
-    "investable": Trait(
-        attributes={"capital_cost", "build_year", "lifetime", "capacity"},
-        on={"entity_type": {"Generator", "Line", "Link", "Store"}},
+types = {
+    "Generator": TypeSpec(
+        description="A device attached to a bus that can generate power.",
+        attributes={
+            "carrier": TypeAttribute(),
+            "sign": TypeAttribute(default=1.0),
+            "p_nom_max": TypeAttribute(default=float("inf"), unit="MW"),
+        },
     ),
-    "dispatchable": Trait(
-        attributes={"p_min_pu", "p_max_pu", "p_set"},
-        on={"entity_type": {"Generator", "Link"}},
+    "Load": TypeSpec(
+        attributes={
+            "carrier": TypeAttribute(),
+            "sign": TypeAttribute(default=-1.0),
+        },
     ),
 }
 ```
 
-**A trait narrows; it does not grant.** An attribute the schema declares is carried by every entity type it can address, and a trait is the only thing that cuts that down.
-Writing `entity` in an attribute's `dims` is what says it is per component; declining to bundle it says it is so for every type — the same thing `dims={"scenario"}` already means along the scenario axis, where no subscription mechanism exists and nobody finds it surprising.
+**The grant is the whole answer.** In a typed schema, `Schema.attributes_for(ctype)` reads `types[ctype]` and nothing else - what [`flags`](record.md#flags) and the [`add` routing](working-record.md#add-remove) read, so everything downstream asks one question and gets a resolved answer, from the schema alone and never from data.
+An entity-addressed attribute granted by no type is a schema error: it is a forgotten grant or a typo, and "declared but unreachable" has no use.
+The alternative - unlisted-by-everyone reaches everyone - was rejected because one type's new entry would silently strip the attribute from every other type, at a distance; [the proposal](proposals/per-type-attributes.md) has the full argument.
 
-That direction is why [an attribute belonging to no type](proposals/dims-groups-traits.md#what-starts-it) has somewhere to live at all.
-Under the previous shape a type _subscribed_ and an attribute reached nothing until one did, which is what forced `attributes` to be nested under types and left snapshot weightings homeless.
+**Facets live where the attribute is addressed.** `dtype`, `dims` and `breakpoints` stay record-wide on the spec: one attribute is one file with one `value` column, so [the flatness argument](#attributespec) is about storage.
+`default`, `unit` and `description` are never stored, so they are free to be facts of the `(type, attribute)` pair - and measured on PyPSA's registry they are: 7 attributes differ per type on `default` (`sign` is `1.0` on a `Generator`, `-1.0` on a `Load`), 14 on `unit`, 54 on `description`.
+In a typed schema they are _only_ that: a spec-level facet on an entity-addressed attribute is rejected, so the manifest never holds two slots that both look authoritative.
+There is no inheritance and no override - an absent facet is undeclared, and the shared fact is stated on each grant that carries it.
+An attribute addressed by an axis alone keeps its facets on the spec, having no type to move them to; so does everything in an untyped schema.
 
-`Schema.attributes_for(ctype)` — the untraited attributes addressed by `entity`, plus what the traits naming `ctype` bundle — is what [`flags`](record.md#flags) and the [`add` routing](working-record.md#add-remove) read, so everything downstream asks one question and gets a resolved answer.
-An attribute addressed by an axis alone is carried by no type however few traits mention it: a snapshot weighting belongs to the record.
+**Keys are the Enum labels, exactly.** The [entity-type axis](#entity_type-the-axis-of-kinds) stays the sole declaration of the vocabulary; `types` requires it with an `Enum` dtype, and its keys must equal the labels - a missing key and a stray key are both typos worth an error.
+An entry may be empty, for a type carrying nothing entity-addressed.
+A `str`-typed axis keeps its labels as data and admits no `types` table, and a schema with no type axis at all is untouched: everything addressed by `entity` reaches every component.
 
-A trait rather than a bare list of attribute names, for two reasons.
-The deduplication is real: the boundaries are measured from a framework's registry rather than invented, and `investable` covers six types.
-And a trait is **queryable** — a consumer dispatching on "everything investable" asks the schema rather than enumerating types, which is what makes the vocabulary worth declaring at all.
+**A type is an object.** `TypeSpec.description` says what a `Generator` _is_ - prose a framework registry carries and an `Enum` label cannot.
 
-**Declared, not inferred.** No framework ships a trait registry to read, so the mapping from its component registry to traits is authored and maintained. That cost is the price of the vocabulary being useful to something other than this schema.
+An attribute addressed by an axis alone is carried by no type, however it is spelled: a snapshot weighting belongs to the record, a per-type `icon` to the type axis file, and a grant naming either is rejected.
 
-**Only an entity-type axis may scope a trait.** `on` is keyed by a dim declared `on={"entity"}` and the schema rejects any other, because a trait scoped to, say, `country` would make an attribute's vocabulary depend on data — which attributes a component carries would follow from what its bus maps to, a per-entity lookup every caller of `attributes_for` treats as answerable from the schema alone.
+This replaces the earlier direction, "a trait narrows; it does not grant", under which per-type presence was computed - everything entity-addressed, cut down by traits.
+What that direction protected survives intact: an attribute belonging to no type still has [somewhere to live](proposals/dims-groups-traits.md#what-starts-it).
+What it could not say was a per-type fact - giving `Load` its own `sign` default meant a trait narrowing `sign` away from every other type, until every type had a trait restating what it carries: per-type membership written in a vocabulary designed to say something else.
+[Per-type attributes](proposals/per-type-attributes.md) is the argument.
 
-A trait with an empty `on` narrows nothing: it is a bundle for a consumer to dispatch on, and its attributes stay carried by every type.
+## Traits
 
-A trait may only name an attribute the schema declares: it says which attributes apply, never what they are, so a name with no spec is a typo rather than a shorthand declaration.
-Two traits bundling one attribute is fine — they resolve to a set — since [one attribute has one spec](#attributespec) and there is nothing left to conflict.
-
-### `switch` — a trait a component opts into
-
-A trait narrows two ways, and both are optional: `on` says which entity types carry it, `switch` names an attribute deciding it per component.
+A trait is a **capability**: a named bundle of attributes, and the switch that decides it per component.
 
 ```python
 traits = {
     "committable": Trait(
         attributes={"start_up_cost", "min_up_time", "ramp_limit_start_up"},
-        on={"entity_type": {"Generator", "Link"}},
         switch="committable",
     ),
 }
@@ -225,16 +246,34 @@ attributes = {
 }
 ```
 
-The two never interact: `on` first, then `switch`. A trait with neither reaches every component of every type; one with a switch and no `on` reaches the components whose switch is true, whatever their type — which is how a record declaring no types still says that some components are committable and others are not.
+A trait says nothing about which attributes a type carries - [`types`](#types-what-a-type-carries) does - and it is not scoped by type: which types may carry the capability is the types granted the switch, one source of truth rather than a second list kept in agreement.
+`investable` and `dispatchable` are not traits; every generator is dispatchable, which is a type fact the types table states directly.
+What earns a trait is the distinction finer than a type: fifty of three thousand generators are unit-committed, and `committable` is a property of the individual generator, not of `Generator`.
 
-**The switch is an ordinary attribute**, `dims: [entity]` exactly, with a `dtype`, a `default` and a place [an attribute over `entity` alone](format.md#where-a-value-lives) already has. `bool` is the dtype the [proposal](proposals/trait-switches.md#which-dtypes) admits; an `Enum` switch selecting among several traits is deferred.
+**Declared, not inferred.** No framework ships a capability registry to read, so the mapping is authored and maintained - the price of the vocabulary being useful to something other than this schema.
+
+A trait may only name an attribute the schema declares: it says which attributes the capability bundles, never what they are, so a name with no spec is a typo rather than a shorthand declaration.
+And its bundle must be granted on every type granted its switch - a capability's attributes travel with the attribute that gates them.
+Two traits bundling one attribute is fine - they resolve to a set - since [one attribute has one spec](#attributespec) and the facets live on the grants either way.
+
+### `switch` — a trait a component opts into
+
+`switch` names an attribute deciding the trait per component, and it is the trait's only narrowing.
+
+```python
+attributes = {
+    "committable": AttributeSpec(dtype="bool", dims={"entity"}, default=False),
+}
+```
+
+**The switch is an ordinary attribute**, `dims: [entity]` exactly, with a `dtype`, a `default` and a place [an attribute over `entity` alone](format.md#where-a-value-lives) already has - granted, in a typed schema, like any other. `bool` is the dtype the [proposal](proposals/trait-switches.md#which-dtypes) admits; an `Enum` switch selecting among several traits is deferred.
 Its default decides the unset case, and `false` keeps the bundle off every component that predates the trait.
+A record declaring no types can still say that some components are committable and others are not: the switch is per component, so it needs no type axis at all.
 
 **It joins the trait's `attributes` on its own**, folded in at parse rather than listed by the author, so a consumer asking what `committable` bundles gets the switch with the rest.
-Being in the bundle it would otherwise be narrowed by its own trait, which nothing could then turn on — so it is in `attributes` for discovery and out of the narrowing.
 
-**`attributes_for` is unchanged.** A switched trait's attributes are carried by the type, because the question it answers is which attributes a generator _may_ have; the switch narrows which components carry a _value_, which is a question about data.
-So the switch is a validation and query mechanism rather than a change to the vocabulary. What it is declared for — rejecting a value set on a component whose switch is false, and asking which components a trait reaches — reads the switch column, and neither is wired up yet: the declaration lands first, the [checks that read data](proposals/trait-switches.md#what-it-costs) after. Whether `attributes_for` grows a per-entity counterpart is [open](open-questions.md).
+**`attributes_for` is unchanged.** The question it answers is which attributes a generator _may_ have, which is the grants'; the switch narrows which components carry a _value_, which is a question about data.
+So the switch is a validation and query mechanism rather than a change to the vocabulary. What it is declared for - rejecting a value set on a component whose switch is false, and asking which components a trait reaches - reads the switch column, and neither is wired up yet: the declaration lands first, the [checks that read data](proposals/trait-switches.md#what-it-costs) after. Whether `attributes_for` grows a per-entity counterpart is [open](open-questions.md).
 
 ## Groups
 
@@ -441,10 +480,10 @@ One schema outlives many layers ([above](#one-schema-per-record)), so a change t
 
 - adding an attribute, a component type, a trait, or a group
 - adding a dim no existing attribute varies over
-- subscribing a type to a further attribute, whether directly or through a trait
+- [granting a type](#types-what-a-type-carries) a further attribute
 - widening an `AttributeSpec.dims`: rows that set fewer dims still decode, since an unset dim is NULL and NULL means "all values" ([the broadcast rule](record.md#the-broadcast-rule))
 - adding to `partial`: ownership becomes finer, and an existing layer's rows are simply owned at the coarser granularity they were written with
-- changing a [`unit` or `description`](#unit-and-description), which describe the data without deciding how any row decodes
+- changing a `default`, [`unit` or `description`](#unit-and-description), on a spec or on a grant: none is ever stored, so no written row decodes differently
 
 **Incompatible** — existing rows would decode differently, or not at all:
 
@@ -452,7 +491,7 @@ One schema outlives many layers ([above](#one-schema-per-record)), so a change t
 - changing a `dtype`
 - removing from `partial`: a layer that patched one value along that axis is now a partial override of an axis owned whole, which is exactly the hole [`partial`](#partial-the-granularity-of-an-override) forbids
 - changing `within`, since the axis key changes shape
-- a type ceasing to carry an attribute, whether by dropping it or by unsubscribing the trait that bundled it: its rows are still in the file, now with no valid reading for that type
+- a type ceasing to carry an attribute - its [grant](#types-what-a-type-carries) removed: its rows are still in the file, now with no valid reading for that type
 - adding a dim that does not broadcast, since the fold's ownership key changes shape
 
 Adding a functional group is compatible in the same sense adding any group is: the record gains a file, and until some layer writes it every coordinate reads as unclassified — no row, which is what "no country assigned" means anyway.
@@ -464,7 +503,7 @@ A reader encountering a `version` it was not written for should refuse rather th
 
 ## `unit` and `description`
 
-Both a `Dimension` and an `AttributeSpec` may carry a `unit` and a `description`.
+A `Dimension`, an `AttributeSpec` and a [grant](#types-what-a-type-carries) may carry a `unit` and a `description` - the grant is where a per-component attribute's live in a typed schema, since both may differ per type.
 Neither is interpreted: no conversion, no dimensional analysis, no validation that `MW` and `kW` are not being added.
 They are stored, read back, and handed to whatever displays or documents the record.
 

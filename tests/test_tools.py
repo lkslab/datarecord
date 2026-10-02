@@ -18,12 +18,12 @@ import pytest
 from datarecord import Revision
 from datarecord.duck import layer_dir
 from datarecord.layered.resolve import read_schema, write_schema
+from datarecord.schema import Dimension, TypeSpec
 from datarecord.tools.base import Requirements, Schema, UnsupportedRecordError
 from datarecord.tools.pypsa import ENTITY_TYPE, PyPSA, _colliding_names
 from tests.fixtures import (
     export_network,
     relation,
-    schema,
     write_entity_type,
     write_input,
 )
@@ -130,7 +130,11 @@ def test_verify_reports_a_type_the_tool_does_not_know(con, base_uri, ac_dc):
                     ENTITY_TYPE: axis.model_copy(
                         update={"dtype": nw.Enum([*axis.dtype.categories, "Widget"])}
                     ),
-                }
+                },
+                # `types` keys must equal the labels, and a Widget carries
+                # whatever it likes - the record layer upholds only its own
+                # schema's vocabulary.
+                "types": {**declared.types, "Widget": TypeSpec()},
             }
         )
     )
@@ -152,36 +156,43 @@ _DIMS = {
 
 
 def _without_default(revision, ctype: str, attribute: str) -> None:
-    """Drop one attribute's declared default, leaving the rest of the schema.
+    """Drop one attribute's declared default on one type, leaving the rest.
 
-    `ctype` says which type the caller means it for; the spec itself is
-    declared once record-wide, so dropping the default drops it everywhere.
+    The default is a fact of the grant, so dropping it for `ctype` leaves every
+    other type's reading alone.
     """
     was = read_schema()
     assert attribute in was.attributes_for(ctype)
-    spec = was.attributes[attribute]
-    was.attributes[attribute] = spec.model_copy(update={"default": None})
+    grant = was.types[ctype].attributes[attribute]
+    was.types[ctype].attributes[attribute] = grant.model_copy(update={"default": None})
     write_schema(was)
 
 
-def _with_schema(revision, **kwargs) -> None:
-    """Redeclare the record's schema, keeping the attributes it already declares.
+def _with_schema(revision, dims=_DIMS, partial={"scenario"}) -> None:
+    """Redeclare the record's schema with different axes or granularity.
 
     Written directly rather than through `write_record`, which would reject an
     incompatible redeclaration - here the point is to hand the tool a
-    schema it must report on rather than one the writer accepted.
+    schema it must report on rather than one the writer accepted. Everything
+    but the non-structural dims and `partial` is kept as declared.
 
     Notes
     -----
     - [versioning](https://energy-models.github.io/datarecord/design/schema/#versioning)
     """
     was = read_schema()
-    now = schema(**kwargs).model_copy(
+    kept = {
+        d: spec
+        for d, spec in was.dimensions.items()
+        if d in ("entity", "bus", ENTITY_TYPE)
+    }
+    now = was.model_copy(
         update={
-            "attributes": was.attributes,
-            "groups": was.groups,
-            "traits": was.traits,
-            "meta": was.meta,
+            "dimensions": {
+                **kept,
+                **{d: Dimension(dtype=t) for d, t in dims.items()},
+            },
+            "partial": frozenset(partial),
         }
     )
     write_schema(now)

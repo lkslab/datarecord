@@ -26,7 +26,7 @@ from datarecord.layered.revision import ancestry
 from datarecord.layered.sources import ParquetLayer
 from datarecord.layered.write import write_record
 from datarecord.record import EMPTY
-from datarecord.schema import AttributeSpec
+from datarecord.schema import AttributeSpec, TypeAttribute
 from datarecord.tools.pypsa import PyPSA
 from tests.fixtures import export_network, outputs, relation, tombstone, write_input
 
@@ -270,14 +270,16 @@ def test_a_new_attribute_is_a_schema_amendment(con, parent):
     - [one schema per record](https://energy-models.github.io/datarecord/design/schema/#one-schema-per-record)
     """
     amended = read_schema()
-    # Declared once, record-wide, then narrowed to the type that carries it -
-    # the two halves an amendment now has.
+    # Declared once, record-wide, then granted to the type that carries it -
+    # the two halves an amendment has, with the default on the grant.
     amended.attributes["p_min_pu"] = AttributeSpec(
-        dtype=nw.Float64(), dims={"entity", "snapshot"}, default=0.25
+        dtype=nw.Float64(), dims={"entity", "snapshot"}
     )
-    was = amended.traits["Generator"]
-    amended.traits["Generator"] = was.model_copy(
-        update={"attributes": was.attributes | {"p_min_pu"}}
+    was = amended.types["Generator"]
+    amended.types["Generator"] = was.model_copy(
+        update={
+            "attributes": {**was.attributes, "p_min_pu": TypeAttribute(default=0.25)}
+        }
     )
     write_schema(amended)
 

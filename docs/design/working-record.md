@@ -94,7 +94,7 @@ record.set("p", solved, kind="outputs")  # a result
 **There is no `entity_type` keyword.** A name identifies one component across every type ([entity is unique across types](format.md#entity-is-unique-across-types)), so the type is a property of the name rather than something the caller supplies: the record looks it up in the resolved components map, which is the same read `entity` is already [checked against](#validation).
 That removes the parameter that had to be either given or inferred in every earlier spelling, and with it the class of error where a name was staged under the wrong type.
 
-One call may therefore span types, since the names decide: `set("p_nom", {"wind1": 150.0, "link_dc": 80.0})` checks that Generator and Link each [carry](schema.md#traits) `p_nom`, and stages both.
+One call may therefore span types, since the names decide: `set("p_nom", {"wind1": 150.0, "link_dc": 80.0})` checks that Generator and Link each [carry](schema.md#types-what-a-type-carries) `p_nom`, and stages both.
 The **spec** is the same for both, one attribute having [one spec record-wide](schema.md#attributespec); what varies per type is whether it carries the attribute at all, so an attribute one type subscribes to and another does not is an error naming the name that caused it.
 
 `entity=None` means every component the record resolves that the schema declares this attribute for — the types declaring `attribute`, not every type.

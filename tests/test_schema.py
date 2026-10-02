@@ -23,6 +23,8 @@ from datarecord.schema import (
     Group,
     Schema,
     Trait,
+    TypeAttribute,
+    TypeSpec,
     flag_type,
 )
 
@@ -44,7 +46,8 @@ def _schema(**overrides) -> Schema:
             # `entity_type` the entity-type axis.
             "entity_type": Group(over=["entity"], into="entity_type"),
         },
-        # Declared once, record-wide; a trait narrows one to some types.
+        # Declared once, record-wide; `types` grants one to the types that
+        # carry it, with the per-type facets on the grant.
         "attributes": {
             "p_nom": AttributeSpec(dtype=nw.Float64(), dims={"entity"}),
             "p_max_pu": AttributeSpec(
@@ -60,14 +63,20 @@ def _schema(**overrides) -> Schema:
                 dtype=nw.Float64(), dims={"connection", "scenario", "timestep"}
             ),
         },
-        "traits": {
-            "dispatchable": Trait(
-                attributes={"p_nom", "p_max_pu", "marginal_cost", "carrier"},
-                on={"entity_type": frozenset({"Generator"})},
+        "types": {
+            "Generator": TypeSpec(
+                attributes={
+                    "p_nom": TypeAttribute(),
+                    "p_max_pu": TypeAttribute(),
+                    "marginal_cost": TypeAttribute(),
+                    "carrier": TypeAttribute(),
+                }
             ),
-            "converting": Trait(
-                attributes={"efficiency"},
-                on={"entity_type": frozenset({"Link"})},
+            "Link": TypeSpec(
+                attributes={
+                    "carrier": TypeAttribute(),
+                    "efficiency": TypeAttribute(),
+                }
             ),
         },
         "partial": frozenset({"scenario"}),
@@ -161,33 +170,129 @@ def test_partial_may_not_name_a_membership_key():
         )
 
 
-# -- entity types and traits (https://energy-models.github.io/datarecord/design/schema/#traits) ------------------------------------
+# -- entity types and grants (https://energy-models.github.io/datarecord/design/schema/#types-what-a-type-carries) ------------------------------------
 
 
-def test_an_untraited_attribute_is_carried_by_every_type():
-    """A trait narrows; declaring `entity` in `dims` is what grants.
+def test_presence_is_the_grant():
+    """`attributes_for` reads `types[ctype]` and nothing else."""
+    s = _schema()
+    assert "p_max_pu" in s.attributes_for("Generator")
+    assert "p_max_pu" not in s.attributes_for("Link"), "granted to Generator alone"
+    assert "carrier" in s.attributes_for("Link"), "granted to both"
 
-    `sign` is bundled by no trait, so every type addressed by `entity` carries
-    it - the same thing `dims={"scenario"}` means along the scenario axis.
-    Where `p_max_pu`, which `dispatchable` bundles, reaches Generator alone.
+
+def test_an_ungranted_entity_attribute_is_rejected():
+    """Declared but reachable by no type is a forgotten grant or a typo."""
+    with pytest.raises(ValidationError, match="granted by no type"):
+        _schema(
+            attributes={
+                **_schema().attributes,
+                "sign": AttributeSpec(dtype=nw.Float64(), dims={"entity"}),
+            }
+        )
+
+
+def test_a_grant_carries_the_per_type_facets():
+    """One attribute, one spec - and each type reads it with its own facets.
+
+    `Schema.attributes[a]` is untouched; the copy `attributes_for` hands back
+    is the resolved per-type view.
     """
+    base = _schema()
     s = _schema(
         attributes={
-            **_schema().attributes,
+            **base.attributes,
             "sign": AttributeSpec(dtype=nw.Float64(), dims={"entity"}),
-        }
+        },
+        types={
+            "Generator": base.types["Generator"].model_copy(
+                update={
+                    "attributes": {
+                        **base.types["Generator"].attributes,
+                        "sign": TypeAttribute(default=1.0, unit=""),
+                    }
+                }
+            ),
+            "Link": base.types["Link"].model_copy(
+                update={
+                    "attributes": {
+                        **base.types["Link"].attributes,
+                        "sign": TypeAttribute(default=-1.0, description="Flipped."),
+                    }
+                }
+            ),
+        },
     )
-    assert "p_max_pu" not in s.attributes_for("Link"), "narrowed to Generator"
-    assert "sign" in s.attributes_for("Link"), "untraited, so carried by all"
-    assert "sign" in s.attributes_for("Generator")
+    assert s.attributes_for("Generator")["sign"].default == 1.0
+    assert s.attributes_for("Generator")["sign"].unit == ""
+    assert s.attributes_for("Link")["sign"].default == -1.0
+    assert s.attributes_for("Link")["sign"].description == "Flipped."
+    assert s.attributes["sign"].default is None, "the record-wide spec is untouched"
+    assert s.types_declaring("sign") == frozenset({"Generator", "Link"})
+
+
+def test_types_keys_must_equal_the_labels():
+    """A missing key and a stray key are both typos worth an error."""
+    base = _schema()
+    with pytest.raises(ValidationError, match="missing \\['Link'\\]"):
+        _schema(types={"Generator": base.types["Generator"]})
+    with pytest.raises(ValidationError, match="unknown \\['Store'\\]"):
+        _schema(types={**base.types, "Store": TypeSpec()})
+
+
+def test_types_requires_an_enum_axis():
+    """A `str`-typed axis keeps its labels as data, so there is nothing to grant to."""
+    base = _schema()
+    with pytest.raises(ValidationError, match="Enum dtype"):
+        _schema(
+            dimensions={
+                **base.dimensions,
+                "entity_type": Dimension(dtype=nw.String()),
+            }
+        )
+
+
+def test_a_grant_must_name_a_declared_entity_attribute():
+    base = _schema()
+
+    def granting(attribute: str) -> dict:
+        grants = {**base.types["Generator"].attributes, attribute: TypeAttribute()}
+        return {**base.types, "Generator": TypeSpec(attributes=grants)}
+
+    with pytest.raises(ValidationError, match="undeclared attribute 'nope'"):
+        _schema(types=granting("nope"))
+    with pytest.raises(ValidationError, match="no entity addresses"):
+        _schema(
+            attributes={
+                **base.attributes,
+                "weighting": AttributeSpec(dtype=nw.Float64(), dims={"timestep"}),
+            },
+            types=granting("weighting"),
+        )
+    with pytest.raises(ValidationError, match="which is a result"):
+        _schema(
+            results={"p": AttributeSpec(dtype=nw.Float64(), dims={"entity"})},
+            types=granting("p"),
+        )
+
+
+def test_a_spec_level_facet_is_rejected_in_a_typed_schema():
+    """Facets live where the attribute is addressed, so one fact has one slot."""
+    with pytest.raises(ValidationError, match="live on the grants"):
+        _schema(
+            attributes={
+                **_schema().attributes,
+                "p_nom": AttributeSpec(dtype=nw.Float64(), dims={"entity"}, unit="MW"),
+            }
+        )
 
 
 def test_an_attribute_addressing_no_entity_reaches_no_type():
-    """A record-level attribute belongs to the record, however few traits name it.
+    """A record-level attribute belongs to the record, and needs no grant.
 
-    Default-open is scoped by addressing rather than by trait membership: with
-    no `entity` among its coordinates there is no component for it to reach,
-    so `names=None` targets nothing rather than every component in the record.
+    With no `entity` among its coordinates there is no component for it to
+    reach, so it escapes the granted-by-no-type error and `names=None` targets
+    nothing rather than every component in the record.
     """
     s = _schema(
         attributes={
@@ -200,27 +305,49 @@ def test_an_attribute_addressing_no_entity_reaches_no_type():
     assert s.types_declaring("weighting") == frozenset()
 
 
-def test_a_group_addressed_attribute_reaches_the_types_it_coordinates():
+def test_a_group_addressed_attribute_is_granted_like_any_other():
     """`efficiency` is over `connection`, whose coordinates include `entity`."""
     s = _schema()
     assert s.addresses_entity("efficiency")
     assert "efficiency" in s.attributes_for("Link")
+    assert "efficiency" not in s.attributes_for("Generator")
 
 
-def test_a_trait_may_only_be_scoped_by_an_entity_type_axis():
-    """Any other classification would make the vocabulary a per-entity data lookup."""
-    with pytest.raises(ValidationError, match="does not classify `entity`"):
-        Schema(
-            dimensions={
-                "entity": Dimension(dtype=nw.String()),
-                "bus": Dimension(dtype=nw.String()),
-                "country": Dimension(dtype=nw.String()),
-            },
-            groups={"country": Group(over=["bus"], into="country")},
-            attributes={"p_nom": AttributeSpec(dtype=nw.Float64(), dims={"entity"})},
-            traits={"t": Trait(attributes={"p_nom"}, on={"country": {"DE"}})},
-            partial=frozenset(),
-        )
+def _committable(*, grant_bundle_to: set[str]) -> Schema:
+    """`_schema` plus a `committable` capability, its grants set per type."""
+    base = _schema()
+    extra = {"committable", "start_up_cost"}
+    return _schema(
+        attributes={
+            **base.attributes,
+            "start_up_cost": AttributeSpec(dtype=nw.Float64(), dims={"entity"}),
+            "committable": AttributeSpec(dtype=nw.Boolean(), dims={"entity"}),
+        },
+        types={
+            ctype: spec.model_copy(
+                update={
+                    "attributes": {
+                        **spec.attributes,
+                        **{
+                            a: TypeAttribute()
+                            for a in (extra if ctype in grant_bundle_to else ())
+                        },
+                    }
+                }
+            )
+            for ctype, spec in base.types.items()
+        },
+        traits={
+            "committable": Trait(attributes={"start_up_cost"}, switch="committable")
+        },
+    )
+
+
+def test_a_trait_requires_a_switch():
+    """A trait that gates nothing says nothing: presence is `types`' alone."""
+    with pytest.raises(ValidationError, match="switch"):
+        # The missing argument is the case under test.
+        Trait(attributes={"start_up_cost"})  # type: ignore[call-arg]
 
 
 def test_a_trait_switch_is_folded_into_attributes():
@@ -232,30 +359,45 @@ def test_a_trait_switch_is_folded_into_attributes():
 def test_a_trait_switch_narrows_neither_attributes_for_nor_the_switch_itself():
     """`switch` is a validation and query mechanism, not a change to `attributes_for`.
 
-    The schema-level answer stays type-scoped: `committable` the attribute is
-    carried by every type `committable` the trait is `on`, whatever any
-    component's switch value - and it is not narrowed by its own trait.
+    The schema-level answer stays the grants': `committable` and its bundle are
+    carried by every type granted them, whatever any component's switch value.
     """
-    s = _schema(
-        attributes={
-            **_schema().attributes,
-            "start_up_cost": AttributeSpec(dtype=nw.Float64(), dims={"entity"}),
-            "committable": AttributeSpec(
-                dtype=nw.Boolean(), dims={"entity"}, default=False
-            ),
-        },
-        traits={
-            **_schema().traits,
-            "committable": Trait(
-                attributes={"start_up_cost"},
-                on={"entity_type": frozenset({"Generator"})},
-                switch="committable",
-            ),
-        },
-    )
+    s = _committable(grant_bundle_to={"Generator"})
     assert "start_up_cost" in s.attributes_for("Generator")
     assert "committable" in s.attributes_for("Generator")
     assert "start_up_cost" not in s.attributes_for("Link")
+
+
+def test_a_traits_bundle_travels_with_its_switch():
+    """A type granted the switch without the bundle has a gate on nothing."""
+    base = _schema()
+    grants = {
+        **base.types["Generator"].attributes,
+        "committable": TypeAttribute(),
+    }
+    with pytest.raises(ValidationError, match="bundle travels with its switch"):
+        _schema(
+            attributes={
+                **base.attributes,
+                "start_up_cost": AttributeSpec(dtype=nw.Float64(), dims={"entity"}),
+                "committable": AttributeSpec(dtype=nw.Boolean(), dims={"entity"}),
+            },
+            types={
+                **base.types,
+                "Generator": TypeSpec(attributes=grants),
+                "Link": base.types["Link"].model_copy(
+                    update={
+                        "attributes": {
+                            **base.types["Link"].attributes,
+                            "start_up_cost": TypeAttribute(),
+                        }
+                    }
+                ),
+            },
+            traits={
+                "committable": Trait(attributes={"start_up_cost"}, switch="committable")
+            },
+        )
 
 
 def test_a_switched_trait_needs_no_entity_type_axis():
@@ -276,17 +418,18 @@ def test_a_switched_trait_needs_no_entity_type_axis():
 def test_a_trait_switch_must_be_addressed_by_entity_alone():
     """A switch narrower or wider than `entity` alone has no per-component reading."""
     with pytest.raises(ValidationError, match="addressed by `entity` alone"):
-        _schema(
+        Schema(
+            dimensions={
+                "entity": Dimension(dtype=nw.String()),
+                "scenario": Dimension(dtype=nw.String()),
+            },
             attributes={
-                **_schema().attributes,
                 "committable": AttributeSpec(
                     dtype=nw.Boolean(), dims={"entity", "scenario"}, default=False
                 ),
             },
-            traits={
-                **_schema().traits,
-                "committable": Trait(switch="committable"),
-            },
+            traits={"committable": Trait(switch="committable")},
+            partial=frozenset({"scenario"}),
         )
 
 
@@ -343,6 +486,10 @@ def test_an_attribute_may_be_addressed_by_the_entity_type_alone():
         attributes={
             "p_nom": AttributeSpec(dtype=nw.Float64(), dims={"entity"}),
             "icon": AttributeSpec(dtype=nw.String(), dims={"entity_type"}),
+        },
+        types={
+            "Bus": TypeSpec(),
+            "Generator": TypeSpec(attributes={"p_nom": TypeAttribute()}),
         },
         partial=frozenset(),
     )
@@ -513,6 +660,17 @@ def test_a_default_survives_the_manifest_round_trip(value):
     assert repr(back.attributes["p_nom_max"].default) == repr(value)
 
 
+@pytest.mark.parametrize("value", [float("inf"), float("-inf"), -1.0, None, "AC"])
+def test_a_grant_default_survives_the_manifest_round_trip(value):
+    """A grant's default takes the same `__inf__` encoding the spec's does."""
+    schema = _schema()
+    schema.types["Generator"].attributes["p_nom"] = TypeAttribute(default=value)
+    back = Schema.model_validate_json(schema.model_dump_json())
+    assert back == schema
+    assert repr(back.types["Generator"].attributes["p_nom"].default) == repr(value)
+    assert repr(back.attributes_for("Generator")["p_nom"].default) == repr(value)
+
+
 # -- versioning (https://energy-models.github.io/datarecord/design/schema/#versioning) -------------------------------------------------------
 
 
@@ -565,6 +723,23 @@ def test_removing_from_partial_is_incompatible():
     new = _schema()
     reasons = new.compatible_with(old)
     assert any("no longer `partial`" in r for r in reasons)
+
+
+def test_granting_a_type_a_further_attribute_is_compatible():
+    """The type's old rows decode as before; new rows gain a reading."""
+    old = _schema()
+    new = _schema()
+    new.types["Link"].attributes["p_nom"] = TypeAttribute()
+    assert new.compatible_with(old) == []
+
+
+def test_removing_a_grant_is_incompatible():
+    """The type's rows are still in the file, now with no valid reading."""
+    old = _schema()
+    new = _schema()
+    del new.types["Generator"].attributes["p_max_pu"]
+    (reason,) = new.compatible_with(old)
+    assert "'Generator' no longer carries ['p_max_pu']" in reason
 
 
 def test_changing_nesting_is_incompatible():
@@ -625,7 +800,7 @@ def test_undeclared_is_none_not_empty():
 
 
 def test_changing_a_unit_is_compatible():
-    """Neither field decides how a row decodes, so editing one is compatible.
+    """No facet decides how a row decodes, so editing one is compatible.
 
     Notes
     -----
@@ -633,9 +808,8 @@ def test_changing_a_unit_is_compatible():
     """
     old = _schema()
     new = _schema()
-    spec = new.attributes["p_nom"]
-    new.attributes["p_nom"] = spec.model_copy(
-        update={"unit": "kW", "description": "Rated power."}
+    new.types["Generator"].attributes["p_nom"] = TypeAttribute(
+        default=0.0, unit="kW", description="Rated power."
     )
     assert new.compatible_with(old) == []
 
