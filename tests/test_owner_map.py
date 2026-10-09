@@ -21,9 +21,13 @@ import pytest
 
 from datarecord import NewChild, Revision, WorkingRecord
 from datarecord.duck import layer_dir, resolved_dir, union_all_by_name
+from datarecord.layered import resolve
 from datarecord.layered.resolve import write_schema
+from datarecord.layered.revision import Record
 from datarecord.layered.sources import DirectorySource, LayerSource, ParquetLayer
+from datarecord.layered.write import write_record
 from datarecord.schema import Schema
+from datarecord.tools.pypsa import PyPSA
 from tests.fixtures import export_network, tombstone, write_input
 
 
@@ -446,3 +450,75 @@ def test_a_read_joins_no_more_rows_than_the_layers_hold(con, base_uri):
     assert _largest_intermediate(con, rel) <= stored, (
         "no operator produces more rows than the layer holds"
     )
+
+
+# -- the stored owner map (standalone records) --------------------------------
+
+
+@pytest.fixture
+def standalone(con, base_uri, ac_dc, tmp_path):
+    """One network written whole as a standalone record directory."""
+    out = tmp_path / "standalone"
+    write_record(None, PyPSA.to_datarecord(ac_dc), con, uri=str(out))
+    return out
+
+
+def test_a_standalone_record_reads_its_stored_map(con, standalone, monkeypatch):
+    """`Record.at` answers off the stored file; the live fold never runs.
+
+    The point of storing the map: opening a standalone record costs a read of
+    one small file rather than an aggregation over every `inputs/` file, per
+    connection.
+
+    Notes
+    -----
+    - [the owner map](https://energy-models.github.io/datarecord/design/read-path/#owner-map)
+    """
+
+    def boom(*args, **kwargs):
+        msg = "the stored map should answer, not a live fold"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(resolve, "fold_inputs", boom)
+    record = Record.at(str(standalone), con)
+    assert "p_max_pu" in record.attributes
+    assert "p_max_pu" in record.flags("Generator")
+
+
+def test_a_moved_standalone_record_still_resolves_rows(con, standalone, tmp_path):
+    """The reader stamps its own `layer_uuid`, so the map survives a move.
+
+    A directory's layer id derives from its location (and the record is even
+    *written* under a staging path), so a stored id would name a layer no
+    reader holds and every row read would come back empty.
+
+    Notes
+    -----
+    - [one record over one fold](https://energy-models.github.io/datarecord/design/read-path/#one-record-over-one-fold)
+    """
+    moved = tmp_path / "elsewhere"
+    standalone.rename(moved)
+    rows = Record.at(str(moved), con).resolver.attribute("p_max_pu").df()
+    assert not rows.empty
+
+
+def test_a_record_without_a_stored_map_folds_and_agrees(con, standalone):
+    """An old record (no stored map) still opens, folding live to the same map.
+
+    Notes
+    -----
+    - [the owner map](https://energy-models.github.io/datarecord/design/read-path/#owner-map)
+    """
+
+    def snapshot(record):
+        inputs = record.resolver.inputs.df()
+        return (
+            {(r["entity"], str(r.attribute)) for _, r in inputs.iterrows()},
+            record.flags("Generator"),
+        )
+
+    stored_keys, stored_flags = snapshot(Record.at(str(standalone), con))
+    shutil.rmtree(standalone / "owner_map")
+    folded_keys, folded_flags = snapshot(Record.at(str(standalone), con))
+    assert folded_keys == stored_keys
+    assert folded_flags == stored_flags

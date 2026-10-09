@@ -49,7 +49,7 @@ from datarecord.duck import (
     union_all_by_name,
 )
 from datarecord.layered.fold import Fold
-from datarecord.layered.sources import LayerSource, ParquetLayer
+from datarecord.layered.sources import DirectorySource, LayerSource, ParquetLayer
 from datarecord.record import Flags
 from datarecord.schema import Schema
 
@@ -668,6 +668,19 @@ def _frozen_table(
     if persisted is not None:
         return cast_declared(schema, persisted)
 
+    # A standalone record's own stored map answers for a fold of that one
+    # source - so only a single-source fold may read it. The file carries no
+    # `layer_uuid` (a directory's layer id derives from its location, which a
+    # move changes), so the reader's own id is stamped here.
+    if len(sources) == 1:
+        stored = sources[0].stored_map(kind)
+        if stored is not None:
+            stamped = stored.project(
+                star(),
+                lit(str(sources[0].layer_id)).cast(LAYER_UUID_TYPE).alias("layer_uuid"),
+            )
+            return cast_declared(schema, stamped)
+
     if not sources:
         # Nothing frozen to fold, which is a `WorkingRecord` over a base that is
         # itself unfrozen; the tail folds onto an empty map.
@@ -705,6 +718,31 @@ def materialise(
     for kind in map_kinds(schema):
         _fold_kind(kind, sources, con, schema).to_parquet(_map_uri(revision_id, kind))
     _materialise_dims(revision_id, sources, con, schema)
+
+
+def store_owner_maps(uri: str, schema: Schema, con: DuckDBPyConnection) -> None:
+    """Write a standalone record's owner maps beside its rows, under `uri`.
+
+    The directory counterpart of `materialise`, run by `write_record` on a
+    directory target: the record is written whole and renamed into place, so
+    the map folded here is its resolved map forever, and `Record.at` reads it
+    back (`LayerSource.stored_map`) instead of re-aggregating every `inputs/`
+    file per connection. `layer_uuid` is dropped - a directory's layer id
+    derives from its location, which a move changes, so the reader stamps its
+    own.
+
+    Notes
+    -----
+    - [the owner map](https://energy-models.github.io/datarecord/design/read-path/#owner-map)
+    - [the record format](https://energy-models.github.io/datarecord/design/format/)
+    """
+    source = DirectorySource(uri, schema, con)
+    for kind in map_kinds(schema):
+        out = f"{source.base}owner_map/{kind}.parquet"
+        ensure_local_dir(out, parent=True)
+        _fold_kind(kind, [source], con, schema).project(
+            star(exclude=["layer_uuid"])
+        ).to_parquet(out)
 
 
 def _materialise_dims(

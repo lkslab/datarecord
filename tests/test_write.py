@@ -645,3 +645,39 @@ def test_written_layer_overlays(con, base_uri, ac_dc):
 
     resolved = relation(child, "p_nom").filter("entity = 'Manchester Wind'").df()
     assert list(resolved["value"]) == [999.0]
+
+
+def test_a_directory_target_stores_its_owner_map(con, base_uri, tmp_path):
+    """A standalone record carries its own inputs map, with no `layer_uuid`.
+
+    Written whole and renamed into place, the record's map cannot go stale, so
+    folding it at write time is what spares every later open the aggregation
+    over `inputs/`. The layer id is left out: it derives from the directory's
+    location, which the rename out of staging - or any later move - changes,
+    so the reader stamps its own.
+
+    Notes
+    -----
+    - [the owner map](https://energy-models.github.io/datarecord/design/read-path/#owner-map)
+    """
+    out = tmp_path / "standalone"
+    write_record(
+        None, _Source(_SCHEMA, attributes={"p_nom": _long()}), con, uri=str(out)
+    )
+
+    stored = con.read_parquet(str(out / "owner_map" / "inputs.parquet"))
+    assert "layer_uuid" not in stored.columns
+    rows = stored.df()
+    assert list(zip(rows["entity"], rows["attribute"])) == [("steel_dri", "p_nom")]
+
+
+def test_a_tree_layer_stores_no_owner_map(con, base_uri):
+    """A tree layer's map depends on its ancestors; `materialise` is its cache.
+
+    Notes
+    -----
+    - [materialised node caches](https://energy-models.github.io/datarecord/design/layers/#materialised-node-caches)
+    """
+    revision = Revision.create(con)
+    write_record(revision.id, _Source(_SCHEMA, attributes={"p_nom": _long()}), con)
+    assert not Path(layer_dir(revision.id), "owner_map").exists()

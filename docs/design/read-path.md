@@ -40,6 +40,11 @@ Keying on the type would let an entity resolve to two rows, admitting at read ti
 
 The map is built by folding along the root→node path: parent map minus deletions and overrides, union the layer's own keys.
 A node whose caches are [materialised](layers.md#materialised-node-caches) persists it (and the resolved axes beside it), so a read needs only the ancestry **back to the nearest materialised node** — the key scalability property.
+
+A **standalone record** has no node to materialise, but the same map: [`write_record`](writing.md) folds it over the rows it just wrote and stores it as `owner_map/inputs.parquet` in the record directory ([format](format.md)), and a single-source fold reads it back instead of re-aggregating every `inputs/` file per connection.
+Written whole and renamed into place, the record cannot change under its map, so the stored map is its resolved map forever.
+The stored file carries **no `layer_uuid`**: a directory's layer id derives from its location, which the rename out of staging — or any later move — changes, so the reader stamps its own id over every row.
+A record written before the map existed simply misses the probe and folds live, as a tree layer always does.
 Every membership's tombstones reach this map in the fold: `fold_inputs` anti-joins the parent against the deleted rows of the entity axis, of each group, and of each partial dim — read from the same file that membership folds from — so a key whose entity, connection tuple or dim coordinate was deleted is absent from the resolved map rather than filtered at read.
 This is not a cascade: each membership honours only its _own_ tombstones, so deleting a component drops the component's own row but not its connection tuples — those stay until deleted in turn.
 The coordinate a membership keys on [never broadcasts](record.md#the-broadcast-rule), so a row not addressed by one carries NULL there and its NULL-safe anti-join never takes it; only a row naming a dead coordinate is dropped.

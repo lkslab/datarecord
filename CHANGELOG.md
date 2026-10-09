@@ -11,6 +11,15 @@ All notable changes to datarecord are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `write_record` with a directory target stores the record's inputs owner map
+  as `owner_map/inputs.parquet` beside the rows, and a single-source fold reads
+  it back (`LayerSource.stored_map`), so opening a standalone record no longer
+  re-aggregates every `inputs/` file per connection. The stored file carries no
+  `layer_uuid` — the reader stamps its own, so a moved record still resolves —
+  and a record without the file folds live as before.
+
 ### Changed
 
 - Per-type attribute facts are first-class: `Schema.types` declares what each

@@ -251,6 +251,10 @@ class StagedSource:
         """A staging area has no `resolved/` cache: it is never a fold's base."""
         return None
 
+    def stored_map(self, kind: str = "inputs") -> DuckDBPyRelation | None:
+        """A staging area's rows change under a reader, so no stored map holds."""
+        return None
+
     def axes(self) -> set[str]:
         """The dims with staged rows, `entity` among them.
 

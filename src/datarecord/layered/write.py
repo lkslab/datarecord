@@ -26,7 +26,12 @@ from duckdb import ConstantExpression as lit
 from duckdb import StarExpression as star
 
 from datarecord.duck import as_relation, base_uri_of, fn, layer_dir, union_all_by_name
-from datarecord.layered.resolve import cast_declared, read_schema, write_schema
+from datarecord.layered.resolve import (
+    cast_declared,
+    read_schema,
+    store_owner_maps,
+    write_schema,
+)
 from datarecord.record import Frames, LayerData, RecordLike, collision_detail
 from datarecord.schema import Schema
 
@@ -160,6 +165,11 @@ def write_record(
                     drop=("entity_type",) if kind == "entities" else (),
                 )
         _require_unique(tagged, con)
+        # A standalone record is written whole and renamed into place, so the
+        # map folded over the staged rows is its resolved map forever; a tree
+        # layer's map depends on its ancestors, which `materialise` folds.
+        if local and uri is not None:
+            store_owner_maps(staging, schema, con)
     except BaseException:
         if local:
             shutil.rmtree(staging, ignore_errors=True)

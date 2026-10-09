@@ -160,6 +160,23 @@ class LayerSource(Protocol):
         """
         ...
 
+    def stored_map(self, kind: str = "inputs") -> DuckDBPyRelation | None:
+        """`owner_map/<kind>.parquet` - the map `write_record` stored beside the rows.
+
+        Only a standalone record directory carries one: its rows are written
+        whole and renamed into place, so the map folded at write time is the
+        record's resolved map forever. It answers for a fold of this source
+        alone, and carries no `layer_uuid` - a directory's layer id derives
+        from its location, which a move changes, so the reader stamps its own.
+        `None` for a tree layer or a staging area, which are resolved by
+        folding.
+
+        Notes
+        -----
+        - [the stored owner map](https://energy-models.github.io/datarecord/design/read-path/#owner-map)
+        """
+        ...
+
     def attribute(self, name: str, kind: Kind = "inputs") -> DuckDBPyRelation | None:
         """`<kind>/<name>.parquet` - one attribute's own columns, unpadded.
 
@@ -258,6 +275,9 @@ class _FileLayer:
 
     def all_attributes(self, kind: Kind = "inputs") -> DuckDBPyRelation | None:
         return self._read(f"{kind}/*.parquet", union_by_name=True)
+
+    def stored_map(self, kind: str = "inputs") -> DuckDBPyRelation | None:
+        return self._read(f"owner_map/{kind}.parquet")
 
     def materialised(self, con: DuckDBPyConnection, schema: Schema) -> Fold | None:
         """No cache by default: only a `ParquetLayer` has a revision to key one by."""

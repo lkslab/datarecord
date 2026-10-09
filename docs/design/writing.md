@@ -20,6 +20,8 @@ An existing layer directory is an error rather than an overwrite or a merge, so 
 Keys are looked up one at a time and each file written before the next is built, so a lazily-building source does one read per file written rather than one per key up front.
 Frames are staged into a sibling directory and renamed on success, so a frame the fold could not resolve leaves no layer rather than half of one.
 
+A directory target additionally gets its [owner map](read-path.md#owner-map) folded over the staged rows and stored as `owner_map/inputs.parquet` ([format](format.md)): a standalone record is written whole, so the map cannot go stale, and storing it spares every later open the aggregation over `inputs/` that a tree node pays only until it is [materialised](layers.md#materialised-node-caches).
+
 Every column the schema declares a type for is cast to it on the way out, so a record's files carry the schema's types and a reader can trust them.
 Without that a source may hand over an all-NULL column its dataframe library typed as float, and every reader would re-cast defensively instead.
 

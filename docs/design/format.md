@@ -18,8 +18,11 @@ record/
 │   └── <dim>.parquet               # one axis table per declared dim
 ├── groups/<group>.parquet          # which tuples of the group exist
 ├── inputs/<attr>.parquet           # one varying input attribute per file
-└── outputs/<attr>.parquet          # one result attribute per file
+├── outputs/<attr>.parquet          # one result attribute per file
+└── owner_map/inputs.parquet        # the stored owner map (standalone records)
 ```
+
+`owner_map/` is derived, not data: the record's [owner map](read-path.md#owner-map), folded over the rows at write time so a reader opens the record without re-aggregating every `inputs/` file. Only a standalone directory carries one — a tree layer's map depends on its ancestors, cached by [materialisation](layers.md#materialised-node-caches) instead — and a record without the file (written by an older writer, or by hand) reads the same by folding live.
 
 Every file under `dims/` and `groups/` is named for what it holds, singular: `dims/scenario.parquet` for the `scenario` axis, as `inputs/p_nom.parquet` is for `p_nom`.
 A dim's file is its name and nothing else — no pluralisation, which would be English grammar applied to a declared identifier and would spell a dim named `bus` as `buss.parquet`.
